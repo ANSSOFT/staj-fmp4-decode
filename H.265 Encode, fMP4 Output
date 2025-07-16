@@ -1,3 +1,4 @@
+#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <vector>
 #include <memory>
@@ -9,17 +10,16 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <libavutil/hwcontext.h>
 }
 
-// Video karelerinin Y (luminance) kanalındaki parlaklıgı artıran basit islem fonksiyonu
 static AVFrame* process_frame(AVFrame* frame) {
-    uint8_t* y_plane = frame->data[0];        // Y kanalının baslangıç adresi
-    int y_stride = frame->linesize[0];        // Y kanalının her satırdaki byte sayısı (stride)
-
+    uint8_t* y_plane = frame->data[0];
+    int y_stride = frame->linesize[0];
     for (int y = 0; y < frame->height; y++) {
         for (int x = 0; x < frame->width; x++) {
-            int val = y_plane[y * y_stride + x];      // Piksel parlaklık degeri (0-255)
-            val = std::min(255, val + 30);            // Parlaklıgı 30 artır, maksimum 255
+            int val = y_plane[y * y_stride + x];
+            val = std::min(255, val + 30);
             y_plane[y * y_stride + x] = val;
         }
     }
@@ -27,32 +27,29 @@ static AVFrame* process_frame(AVFrame* frame) {
 }
 
 int main(int argc, char* argv[]) {
-    // Program arguman kontrolu: input ve output dosya isimleri beklenir
     if (argc < 3) {
         std::cerr << "Kullanım: " << argv[0] << " input.mp4 output.mp4\n";
         return -1;
     }
 
-    const char* input_filename = argv[1];       // Giris video dosyası
-    const char* output_filename = argv[2];      // cıktı video dosyası
+    const char* input_file = argv[1];
+    const char* output_file = argv[2];
 
-    avformat_network_init();                     // Ag protokolleri icin FFmpeg hazırla
+    avformat_network_init();
 
-    // Giris dosyasını ac ve format bilgisini al
-    AVFormatContext* input_fmt_ctx = nullptr;
-    if (avformat_open_input(&input_fmt_ctx, input_filename, nullptr, nullptr) < 0) {
-        std::cerr << "Giris dosyası acılamadı: " << input_filename << "\n";
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, input_file, nullptr, nullptr) < 0) {
+        std::cerr << "Giriş dosyası açılamadı: " << input_file << "\n";
         return -1;
     }
-    if (avformat_find_stream_info(input_fmt_ctx, nullptr) < 0) {
-        std::cerr << "Giris stream bilgisi alınamadı\n";
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        std::cerr << "Stream bilgisi alınamadı\n";
         return -1;
     }
 
-    // Giris dosyasındaki video stream indeksini bul
     int video_stream_index = -1;
-    for (unsigned int i = 0; i < input_fmt_ctx->nb_streams; i++) {
-        if (input_fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             video_stream_index = i;
             break;
         }
@@ -62,198 +59,141 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Giris videoyu decode etmek icin decoder bul ve ac
-    AVCodecParameters* codecpar = input_fmt_ctx->streams[video_stream_index]->codecpar;
+    AVCodecParameters* codecpar = fmt_ctx->streams[video_stream_index]->codecpar;
     const AVCodec* decoder = avcodec_find_decoder(codecpar->codec_id);
     if (!decoder) {
         std::cerr << "Decoder bulunamadı\n";
         return -1;
     }
     AVCodecContext* decoder_ctx = avcodec_alloc_context3(decoder);
-    if (!decoder_ctx) {
-        std::cerr << "Decoder context olusturulamadı\n";
-        return -1;
+    avcodec_parameters_to_context(decoder_ctx, codecpar);
+
+    AVBufferRef* hw_device_ctx = nullptr;
+    if (av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_NONE, nullptr, nullptr, 0) < 0) {
+        std::cerr << "Donanım cihazı oluşturulamadı, devam ediliyor...\n";
+    } else {
+        decoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
     }
-    if (avcodec_parameters_to_context(decoder_ctx, codecpar) < 0) {
-        std::cerr << "Codec parametreleri decoder context'e kopyalanamadı\n";
-        return -1;
-    }
+
     if (avcodec_open2(decoder_ctx, decoder, nullptr) < 0) {
-        std::cerr << "Decoder acılamadı\n";
+        std::cerr << "Decoder açılamadı\n";
         return -1;
     }
 
-    // cıktı dosyası icin MP4 konteyner formatı ve context olustur
-    AVFormatContext* output_fmt_ctx = nullptr;
-    avformat_alloc_output_context2(&output_fmt_ctx, nullptr, "mp4", output_filename);
-    if (!output_fmt_ctx) {
-        std::cerr << "cıktı formatı olusturulamadı\n";
+    AVFormatContext* out_fmt_ctx = nullptr;
+    avformat_alloc_output_context2(&out_fmt_ctx, nullptr, "mp4", output_file);
+    if (!out_fmt_ctx) {
+        std::cerr << "Çıktı formatı oluşturulamadı\n";
         return -1;
     }
 
-    // HEVC encoder olarak önce NVIDIA donanım hızlandırmalı encoder deneniyor,
-    // yoksa yazılım tabanlı libx265 seciliyor
-    const AVCodec* encoder = avcodec_find_encoder_by_name("hevc_nvenc");
+    const AVCodec* encoder = avcodec_find_encoder_by_name("libx265");
     if (!encoder) {
-        std::cout << "hevc_nvenc bulunamadı, libx265 encoder kullanılacak\n";
-        encoder = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-        if (!encoder) {
-            std::cerr << "HEVC encoder bulunamadı\n";
-            return -1;
-        }
-    }
-
-    // cıktı video stream'i olustur
-    AVStream* out_stream = avformat_new_stream(output_fmt_ctx, nullptr);
-    if (!out_stream) {
-        std::cerr << "cıktı stream olusturulamadı\n";
+        std::cerr << "libx265 encoder bulunamadı\n";
         return -1;
     }
 
-    // Encoder icin codec context ayarla ve parametreleri input video ile eslestir
+    AVStream* out_stream = avformat_new_stream(out_fmt_ctx, nullptr);
     AVCodecContext* encoder_ctx = avcodec_alloc_context3(encoder);
-    if (!encoder_ctx) {
-        std::cerr << "Encoder context olusturulamadı\n";
-        return -1;
-    }
     encoder_ctx->height = decoder_ctx->height;
     encoder_ctx->width = decoder_ctx->width;
     encoder_ctx->sample_aspect_ratio = decoder_ctx->sample_aspect_ratio;
-
-    // Encoder pix_fmt listesinden ilk formatı sec veya input pix_fmt kullan
-    encoder_ctx->pix_fmt = encoder->pix_fmts ? encoder->pix_fmts[0] : decoder_ctx->pix_fmt;
-
-    // Frame rate'in tersi olan time_base degerini encoder icin ayarla
+    encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     encoder_ctx->time_base = av_inv_q(decoder_ctx->framerate);
     if (encoder_ctx->time_base.num == 0 || encoder_ctx->time_base.den == 0)
-        encoder_ctx->time_base = input_fmt_ctx->streams[video_stream_index]->time_base;
+        encoder_ctx->time_base = fmt_ctx->streams[video_stream_index]->time_base;
+    encoder_ctx->bit_rate = 4000000;
 
-    encoder_ctx->bit_rate = 4000000; // 4 Mbps bit hızı
+    encoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
 
-    // Eger HEVC codec'i ise dusuk gecikme ve hızlı preset ayarlarını uygula
     if (encoder->id == AV_CODEC_ID_HEVC) {
         av_opt_set(encoder_ctx->priv_data, "preset", "fast", 0);
         av_opt_set(encoder_ctx->priv_data, "tune", "zerolatency", 0);
     }
 
-    // Encoder ac
     if (avcodec_open2(encoder_ctx, encoder, nullptr) < 0) {
-        std::cerr << "Encoder acılamadı\n";
+        std::cerr << "Encoder açılamadı\n";
         return -1;
     }
 
-    // Encoder ayarlarını cıktı stream parametrelerine uygula
-    if (avcodec_parameters_from_context(out_stream->codecpar, encoder_ctx) < 0) {
-        std::cerr << "Codec parametreleri cıktı stream'e kopyalanamadı\n";
-        return -1;
-    }
+    avcodec_parameters_from_context(out_stream->codecpar, encoder_ctx);
     out_stream->time_base = encoder_ctx->time_base;
 
-    // cıktı dosyasını ac (dosya yazımı icin)
-    if (!(output_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&output_fmt_ctx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
-            std::cerr << "cıktı dosyası acılamadı\n";
+    if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&out_fmt_ctx->pb, output_file, AVIO_FLAG_WRITE) < 0) {
+            std::cerr << "Çıktı dosyası açılamadı\n";
             return -1;
         }
     }
 
-    // MP4 konteyneri icin fragment MP4 modunu aktif etmek amacıyla metadata ayarı
-    av_dict_set(&output_fmt_ctx->metadata, "movflags", "frag_keyframe+empty_moov", 0);
-
-    // MP4 konteyner header bilgisini yaz (dosya baslıgı)
-    if (avformat_write_header(output_fmt_ctx, nullptr) < 0) {
+    av_dict_set(&out_fmt_ctx->metadata, "movflags", "frag_keyframe+empty_moov", 0);
+    if (avformat_write_header(out_fmt_ctx, nullptr) < 0) {
         std::cerr << "Header yazılamadı\n";
         return -1;
     }
 
-    AVPacket* packet = av_packet_alloc();    // Paketleri tutmak icin
-    AVFrame* frame = av_frame_alloc();       // Decode edilen kareler icin
-    AVFrame* filt_frame = nullptr;           
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* filt_frame = nullptr;
+    AVFrame* rgb_frame = av_frame_alloc();
+    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_BGR24, decoder_ctx->width, decoder_ctx->height, 1);
+    uint8_t* buffer = new uint8_t[num_bytes];
+    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_BGR24, decoder_ctx->width, decoder_ctx->height, 1);
+    struct SwsContext* sws_ctx = sws_getContext(decoder_ctx->width, decoder_ctx->height, decoder_ctx->pix_fmt, decoder_ctx->width, decoder_ctx->height, AV_PIX_FMT_BGR24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    int64_t pts = 0;
 
-    int ret;
-    int64_t pts = 0;                         // Encode icin frame zaman damgası
-
-    // Giris dosyasından paketleri oku
-    while (av_read_frame(input_fmt_ctx, packet) >= 0) {
-        if (packet->stream_index == video_stream_index) {
-            // Decode icin paketi decoder'a gönder
-            ret = avcodec_send_packet(decoder_ctx, packet);
-            if (ret < 0) {
-                std::cerr << "Decoder'a paket gönderilemedi\n";
+    while (av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == video_stream_index) {
+            if (avcodec_send_packet(decoder_ctx, pkt) < 0)
                 break;
-            }
-
-            // Decoder'dan kareleri al
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(decoder_ctx, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                else if (ret < 0) {
-                    std::cerr << "Frame decode edilemedi\n";
-                    goto cleanup;
-                }
-
-                // Kareyi islem fonksiyonuna gönder (örnek parlaklık artırma)
+            while (avcodec_receive_frame(decoder_ctx, frame) == 0) {
                 filt_frame = process_frame(frame);
+                filt_frame->pts = pts++;
 
-                // İslenmis kareyi encoder'a yolla
-                filt_frame->pts = pts++;  // Zaman damgası ata
-                ret = avcodec_send_frame(encoder_ctx, filt_frame);
-                if (ret < 0) {
-                    std::cerr << "Encoder'a frame gönderilemedi\n";
-                    goto cleanup;
+                avcodec_send_frame(encoder_ctx, filt_frame);
+                while (avcodec_receive_packet(encoder_ctx, pkt) == 0) {
+                    pkt->stream_index = out_stream->index;
+                    av_packet_rescale_ts(pkt, encoder_ctx->time_base, out_stream->time_base);
+                    av_interleaved_write_frame(out_fmt_ctx, pkt);
+                    av_packet_unref(pkt);
                 }
 
-                // Encoder'ın cıkardıgı paketleri oku ve cıktı dosyasına yaz
-                while (ret >= 0) {
-                    ret = avcodec_receive_packet(encoder_ctx, packet);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                    else if (ret < 0) {
-                        std::cerr << "Packet encode edilemedi\n";
-                        goto cleanup;
-                    }
+                sws_scale(sws_ctx, frame->data, frame->linesize, 0, decoder_ctx->height, rgb_frame->data, rgb_frame->linesize);
+                cv::Mat img(decoder_ctx->height, decoder_ctx->width, CV_8UC3, rgb_frame->data[0], rgb_frame->linesize[0]);
+                cv::imshow("Video Frame", img);
+                if (cv::waitKey(25) == 27) goto cleanup;
 
-                    // cıktı stream indeksini ayarla ve zaman damgası dönustur
-                    packet->stream_index = out_stream->index;
-                    av_packet_rescale_ts(packet, encoder_ctx->time_base, out_stream->time_base);
-
-                    // Paketleri interleaved olarak cıktı dosyasına yaz
-                    ret = av_interleaved_write_frame(output_fmt_ctx, packet);
-                    if (ret < 0) {
-                        std::cerr << "Packet cıktı dosyasına yazılamadı\n";
-                        goto cleanup;
-                    }
-                    av_packet_unref(packet);
-                }
                 av_frame_unref(frame);
             }
         }
-        av_packet_unref(packet);
+        av_packet_unref(pkt);
     }
 
-    // Encoder'da kalan frame'leri flush et ve yazdır
     avcodec_send_frame(encoder_ctx, nullptr);
-    while (avcodec_receive_packet(encoder_ctx, packet) == 0) {
-        packet->stream_index = out_stream->index;
-        av_packet_rescale_ts(packet, encoder_ctx->time_base, out_stream->time_base);
-        av_interleaved_write_frame(output_fmt_ctx, packet);
-        av_packet_unref(packet);
+    while (avcodec_receive_packet(encoder_ctx, pkt) == 0) {
+        pkt->stream_index = out_stream->index;
+        av_packet_rescale_ts(pkt, encoder_ctx->time_base, out_stream->time_base);
+        av_interleaved_write_frame(out_fmt_ctx, pkt);
+        av_packet_unref(pkt);
     }
 
-    // Dosya sonlandırma islemi (footer)
-    av_write_trailer(output_fmt_ctx);
+    av_write_trailer(out_fmt_ctx);
 
 cleanup:
-    // Hafıza temizligi: frame, paket ve codec contextlerini serbest bırak
+    delete[] buffer;
+    av_frame_free(&rgb_frame);
+    sws_freeContext(sws_ctx);
     av_frame_free(&frame);
-    av_packet_free(&packet);
+    av_packet_free(&pkt);
     avcodec_free_context(&decoder_ctx);
     avcodec_free_context(&encoder_ctx);
-    avformat_close_input(&input_fmt_ctx);
-    if (!(output_fmt_ctx->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&output_fmt_ctx->pb);
-    avformat_free_context(output_fmt_ctx);
-
+    avformat_close_input(&fmt_ctx);
+    if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&out_fmt_ctx->pb);
+    avformat_free_context(out_fmt_ctx);
+    av_buffer_unref(&hw_device_ctx);
     avformat_network_deinit();
+    cv::destroyAllWindows();
 
     return 0;
 }
